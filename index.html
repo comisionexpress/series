@@ -45,7 +45,7 @@ const storage = {
 };
 
 const SYSTEM =
-  "Sos guionista y showrunner de series. Respondé SOLO con un objeto JSON válido, sin markdown ni texto extra. Tu respuesta tiene un límite corto: respetá estrictamente los máximos de palabras y de elementos que se piden.";
+  "Sos guionista y showrunner de series. Respondé SOLO con un objeto JSON válido, sin markdown ni texto extra. Tu respuesta tiene un límite corto: respetá estrictamente los máximos de palabras y de elementos que se piden. Dentro de los textos del JSON nunca uses comillas dobles (usá comillas simples si hace falta) ni saltos de línea.";
 
 /* ---------- API ---------- */
 
@@ -87,15 +87,57 @@ async function callClaude({ pdf, prompt }) {
     .join("\n");
 }
 
+/* Repara errores típicos: comillas dobles sin escapar dentro de textos, saltos de línea y comas sobrantes */
+function repairJSON(s) {
+  let out = "";
+  let inStr = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (!inStr) {
+      out += c;
+      if (c === '"') inStr = true;
+      continue;
+    }
+    if (c === "\\") {
+      out += c + (s[i + 1] ?? "");
+      i++;
+      continue;
+    }
+    if (c === "\n" || c === "\r" || c === "\t") {
+      out += " ";
+      continue;
+    }
+    if (c === '"') {
+      let j = i + 1;
+      while (j < s.length && /\s/.test(s[j])) j++;
+      const nx = s[j];
+      if (nx === undefined || nx === "," || nx === ":" || nx === "}" || nx === "]") {
+        out += c;
+        inStr = false;
+      } else {
+        out += '\\"';
+      }
+      continue;
+    }
+    out += c;
+  }
+  return out.replace(/,\s*([}\]])/g, "$1");
+}
+
 function parseJSON(text) {
   const clean = text.replace(/```json|```/g, "").trim();
   const a = clean.indexOf("{");
   const b = clean.lastIndexOf("}");
   if (a < 0 || b < 0) throw new Error("La respuesta no vino en formato JSON");
-  return JSON.parse(clean.slice(a, b + 1));
+  const raw = clean.slice(a, b + 1);
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return JSON.parse(repairJSON(raw));
+  }
 }
 
-async function askJSON(args, retries = 1) {
+async function askJSON(args, retries = 2) {
   let last;
   for (let i = 0; i <= retries; i++) {
     try {
