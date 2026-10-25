@@ -60,31 +60,48 @@ async function callClaude({ pdf, prompt }) {
   content.push({ type: "text", text: prompt });
   const key = getKey();
   if (!key) throw new Error("Falta la clave de API (configurala en Conexión con Claude)");
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": key,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: getModel(),
-      max_tokens: 1800,
-      system: SYSTEM,
-      messages: [{ role: "user", content }],
-    }),
+  const body = JSON.stringify({
+    model: getModel(),
+    max_tokens: 2500,
+    system: SYSTEM,
+    messages: [{ role: "user", content }],
   });
-  if (!res.ok) {
+  const RETRY = [429, 500, 502, 503, 529];
+  let lastMsg = "";
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let res;
+    try {
+      res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": key,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body,
+      });
+    } catch (e) {
+      lastMsg = "sin conexión con la API";
+      await new Promise((r) => setTimeout(r, 3000 * (attempt + 1)));
+      continue;
+    }
+    if (res.ok) {
+      const data = await res.json();
+      if (data.stop_reason === "max_tokens") throw new Error("la respuesta se cortó por el límite de tokens");
+      return data.content
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n");
+    }
     let m = "";
     try { m = (await res.json()).error?.message || ""; } catch {}
-    throw new Error("La API respondió " + res.status + (m ? ": " + m : ""));
+    lastMsg = "La API respondió " + res.status + (m ? ": " + m : "");
+    if (!RETRY.includes(res.status)) throw new Error(lastMsg);
+    const ra = Number(res.headers.get("retry-after")) || 0;
+    await new Promise((r) => setTimeout(r, Math.min(60, Math.max(ra, 5 * (attempt + 1))) * 1000));
   }
-  const data = await res.json();
-  return data.content
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("\n");
+  throw new Error(lastMsg || "no se pudo conectar con la API");
 }
 
 /* Repara errores típicos: comillas dobles sin escapar dentro de textos, saltos de línea y comas sobrantes */
@@ -495,7 +512,7 @@ Devolvé este JSON: {"planos":[{"tipo":"plano general|plano medio|primer plano|d
       if (!planos.length) throw new Error("sin planos");
       updateScene(i, j, (s) => ({ ...s, planos, error: null, cargando: false }));
     } catch (e) {
-      updateScene(i, j, (s) => ({ ...s, planos: null, cargando: false, error: "No se pudo generar esta escena." }));
+      updateScene(i, j, (s) => ({ ...s, planos: null, cargando: false, error: "No se pudo generar esta escena (" + (e && e.message ? e.message : "error desconocido") + ")." }));
     }
   }
 
@@ -531,7 +548,10 @@ Resumen: máximo 20 palabras. Usá solo los nombres disponibles. En español.`;
       updateEp(i, (e) => ({ ...e, escenas }));
       setOpen((o) => ({ ...o, [i]: true }));
       setBusy("Episodio " + ep.n + ": escribiendo los planos de " + escenas.length + " escenas…");
-      await Promise.all(escenas.map((s, j) => generarEscena(i, j, s, escenas.length)));
+      for (let j = 0; j < escenas.length; j++) {
+        setBusy("Episodio " + ep.n + ": escena " + (j + 1) + " de " + escenas.length + "…");
+        await generarEscena(i, j, escenas[j], escenas.length);
+      }
     } catch (e) {
       setError("No se pudo generar el episodio " + ep.n + " (" + e.message + "). Probá de nuevo.");
     }
@@ -541,9 +561,11 @@ Resumen: máximo 20 palabras. Usá solo los nombres disponibles. En español.`;
   async function completarEpisodio(i) {
     setBusy("Completando planos…");
     const ep = projectRef.current.episodios[i];
-    await Promise.all(
-      ep.escenas.map((s, j) => (s.planos ? null : generarEscena(i, j, s, ep.escenas.length)))
-    );
+    for (let j = 0; j < ep.escenas.length; j++) {
+      if (ep.escenas[j].planos) continue;
+      setBusy("Episodio " + ep.n + ": escena " + (j + 1) + " de " + ep.escenas.length + "…");
+      await generarEscena(i, j, ep.escenas[j], ep.escenas.length);
+    }
     setBusy(null);
   }
 
