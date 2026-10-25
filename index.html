@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Del libro a la serie</title>
+<style>body{margin:0}</style>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+const LS_KEY = "ajustes:apikey";
+const LS_MODEL = "ajustes:model";
+const getKey = () => localStorage.getItem(LS_KEY) || "";
+const getModel = () => localStorage.getItem(LS_MODEL) || "claude-sonnet-5-5";
+
+/* Guardado local en el navegador (reemplaza al almacenamiento del chat) */
+const storage = {
+  async list(prefix) {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(prefix)) keys.push(k);
+    }
+    return { keys };
+  },
+  async get(key) {
+    const v = localStorage.getItem(key);
+    if (v === null) throw new Error("No existe");
+    return { key, value: v };
+  },
+  async set(key, value) {
+    localStorage.setItem(key, value);
+    return { key, value };
+  },
+  async delete(key) {
+    localStorage.removeItem(key);
+    return { key, deleted: true };
+  },
+};
+
+const SYSTEM =
+  "Sos guionista y showrunner de series. Respondé SOLO con un objeto JSON válido, sin markdown ni texto extra. Tu respuesta tiene un límite corto: respetá estrictamente los máximos de palabras y de elementos que se piden.";
+
+/* ---------- API ---------- */
+
+async function callClaude({ pdf, prompt }) {
+  const content = [];
+  if (pdf) {
+    content.push({
+      type: "document",
+      source: { type: "base64", media_type: "application/pdf", data: pdf },
+    });
+  }
+  content.push({ type: "text", text: prompt });
+  const key = getKey();
+  if (!key) throw new Error("Falta la clave de API (configurala en Conexión con Claude)");
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": key,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: getModel(),
+      max_tokens: 1800,
+      system: SYSTEM,
+      messages: [{ role: "user", content }],
+    }),
+  });
+  if (!res.ok) {
+    let m = "";
+    try { m = (await res.json()).error?.message || ""; } catch {}
+    throw new Error("La API respondió " + res.status + (m ? ": " + m : ""));
+  }
+  const data = await res.json();
+  return data.content
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+}
+
+function parseJSON(text) {
+  const clean = text.replace(/```json|```/g, "").trim();
+  const a = clean.indexOf("{");
+  const b = clean.lastIndexOf("}");
+  if (a < 0 || b < 0) throw new Error("La respuesta no vino en formato JSON");
+  return JSON.parse(clean.slice(a, b + 1));
+}
+
+async function askJSON(args, retries = 1) {
+  let last;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return parseJSON(await callClaude(args));
+    } catch (e) {
+      last = e;
+    }
+  }
+  throw last;
+}
+
+/* ---------- utilidades ---------- */
+
+const fmt = (s) => {
+  const m = Math.floor(s / 60);
+  const r = Math.round(s % 60);
+  return m + ":" + String(r).padStart(2, "0");
+};
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function download(name, text, type) {
+  const blob = new Blob([text], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+const readB64 = (file) =>
+  new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(",")[1]);
+    r.onerror = () => rej(new Error("No se pudo leer el archivo"));
+    r.readAsDataURL(file);
+  });
+
+const epPrompts = (ep) =>
+  (ep.escenas || [])
+    .flatMap((s) => s.planos || [])
+    .map((p, i) => "Plano " + (i + 1) + " (" + p.seg + " s)\n" + p.prompt)
+    .join("\n\n");
+
+const epVoz = (ep) =>
+  (ep.escenas || [])
+    .flatMap((s) => s.planos || [])
+    .map((p) => p.voz)
+    .filter(Boolean)
+    .join("\n");
+
+function guionTexto(p) {
+  const out = [p.titulo + " — " + p.autor, p.analisis?.logline || "", ""];
+  p.episodios.forEach((ep) => {
+    out.push("EPISODIO " + ep.n + ": " + ep.titulo, ep.resumen, "");
+    (ep.escenas || []).forEach((s, j) => {
+      out.push("Escena " + (j + 1) + ": " + s.titulo + " (" + s.seg + " s)");
+      (s.planos || []).forEach((pl, k) => {
+        out.push(
+          "  Plano " + (k + 1) + " · " + pl.tipo + " · " + pl.seg + " s",
+          "  Prompt: " + pl.prompt,
+          pl.voz ? "  Voz en off: " + pl.voz : ""
+        );
+      });
+      out.push("");
+    });
+  });
+  return out.join("\n");
+}
+
+const SEMAFORO = {
+  verde: { txt: "Se adapta bien", cls: "ok" },
+  amarillo: { txt: "Requiere decisiones de adaptación", cls: "mid" },
+  rojo: { txt: "Difícil o costosa de adaptar", cls: "bad" },
+};
+
+/* ---------- componente ---------- */
+
+function MotorDeSeries() {
+  const [file, setFile] = useState(null);
+  const [titulo, setTitulo] = useState("");
+  const [autor, setAutor] = useState("");
+  const [auth, setAuth] = useState(false);
+  const [cfg, setCfg] = useState({ episodios: 5, minutos: 13, sinMenores: true, fr: 1 });
+  const [project, setProject] = useState(null);
+  const [busy, setBusy] = useState(null);
+  const [error, setError] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [open, setOpen] = useState({});
+  const [saved, setSaved] = useState([]);
+  const [apiKey, setApiKey] = useState(getKey());
+  const [model, setModel] = useState(getModel());
+  const [showCfg, setShowCfg] = useState(!getKey());
+  const guardarAjustes = () => {
+    localStorage.setItem(LS_KEY, apiKey.trim());
+    localStorage.setItem(LS_MODEL, model.trim() || "claude-sonnet-5-5");
+    setShowCfg(!apiKey.trim());
+    say("Ajustes guardados");
+  };
+  const projectRef = useRef(null);
+  projectRef.current = project;
+  const locked = !!project;
+
+  const total = cfg.minutos * 60;
+  const perEp = Math.round(total / cfg.episodios);
+  const reglas = cfg.sinMenores
+    ? "Regla de producción: no puede aparecer ningún menor de 18 años en pantalla ni describirse en un prompt de imagen o video. Si la historia involucra niños, resolvelo con adultos, sombras, objetos, manos, planos que los eviten o voz en off."
+    : "";
+
+  const say = (m) => {
+    setToast(m);
+    setTimeout(() => setToast(null), 2200);
+  };
+
+  /* guardado */
+  const loadSaved = useCallback(async () => {
+    try {
+      const r = await storage.list("serie:");
+      const items = [];
+      for (const k of r?.keys || []) {
+        try {
+          const g = await storage.get(k);
+          if (g?.value) {
+            const p = JSON.parse(g.value);
+            items.push({ key: k, titulo: p.titulo, autor: p.autor, updated: p.updated || 0 });
+          }
+        } catch {}
+      }
+      items.sort((a, b) => b.updated - a.updated);
+      setSaved(items);
+    } catch {
+      setSaved([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadSaved();
+  }, [loadSaved]);
+
+  useEffect(() => {
+    if (!project) return;
+    const t = setTimeout(async () => {
+      try {
+        await storage.set(
+          "serie:" + project.id,
+          JSON.stringify({ ...project, updated: Date.now() })
+        );
+        loadSaved();
+      } catch {}
+    }, 900);
+    return () => clearTimeout(t);
+  }, [project, loadSaved]);
+
+  const openSaved = async (key) => {
+    try {
+      const g = await storage.get(key);
+      const p = JSON.parse(g.value);
+      setProject(p);
+      setTitulo(p.titulo);
+      setAutor(p.autor);
+      setAuth(true);
+      setCfg(p.cfg);
+      setFile(null);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch {
+      setError("No se pudo abrir el proyecto guardado.");
+    }
+  };
+
+  const deleteSaved = async (key) => {
+    try {
+      await storage.delete(key);
+    } catch {}
+    loadSaved();
+  };
+
+  const importJSON = async (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f) return;
+    try {
+      const p = JSON.parse(await f.text());
+      if (!p.analisis || !p.bible) throw new Error("El archivo no es un proyecto de este motor");
+      p.id = p.id || "p" + Date.now();
+      setProject(p);
+      setTitulo(p.titulo);
+      setAutor(p.autor);
+      setAuth(true);
+      setCfg(p.cfg);
+      setFile(null);
+      say("Proyecto importado");
+    } catch (err) {
+      setError("No se pudo importar: " + err.message);
+    }
+  };
+
+  const nuevo = () => {
+    setProject(null);
+    setFile(null);
+    setTitulo("");
+    setAutor("");
+    setAuth(false);
+    setOpen({});
+    setError(null);
+  };
+
+  const onFile = async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setError(null);
+    if (f.size > 20 * 1024 * 1024) {
+      setError("El PDF pesa más de 20 MB. Probá con una versión comprimida.");
+      return;
+    }
+    try {
+      const b64 = await readB64(f);
+      setFile({ name: f.name, size: f.size, b64 });
+      if (!titulo) setTitulo(f.name.replace(/\.pdf$/i, ""));
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  /* actualizadores inmutables */
+  const updateEp = (i, fn) =>
+    setProject((p) => ({ ...p, episodios: p.episodios.map((e, k) => (k === i ? fn(e) : e)) }));
+  const updateScene = (i, j, fn) =>
+    updateEp(i, (e) => ({ ...e, escenas: e.escenas.map((s, k) => (k === j ? fn(s) : s)) }));
+
+  /* paso 1: análisis */
+  async function analizar() {
+    setError(null);
+    setBusy("Leyendo el libro y evaluando cómo se adapta…");
+    try {
+      const pA = `Analizá el libro adjunto para adaptarlo a una serie audiovisual de ${cfg.episodios} episodios.
+Devolvé este JSON: {"semaforo":"verde|amarillo|rojo","motivo":"...","logline":"...","tono":"...","genero":"..."}
+Criterios del semáforo: complejidad narrativa, cantidad de personajes, escenarios, escenas de acción y época. verde = se adapta con pocos obstáculos; amarillo = requiere decisiones de adaptación; rojo = muy costosa o riesgosa.
+Máximos: motivo 35 palabras, logline 30 palabras, tono 12 palabras, genero 4 palabras. En español.`;
+      const pB = `Del libro adjunto, extraé la biblia visual para una serie.
+${reglas}
+Devolvé este JSON: {"personajes":[{"nombre":"...","visual":"..."}],"escenarios":[{"nombre":"...","visual":"..."}]}
+Máximo 5 personajes principales y 4 escenarios. El campo "visual" va en inglés, máximo 30 palabras, con rasgos físicos, vestuario y época concretos para repetirlos idénticos en cada prompt de video. Los nombres en español.`;
+      const [a, b] = await Promise.all([
+        askJSON({ pdf: file.b64, prompt: pA }),
+        askJSON({ pdf: file.b64, prompt: pB }),
+      ]);
+      setProject({
+        id: "p" + Date.now(),
+        titulo: titulo.trim() || file.name,
+        autor: autor.trim(),
+        auth: true,
+        cfg,
+        analisis: a,
+        bible: {
+          personajes: (b.personajes || []).slice(0, 5),
+          escenarios: (b.escenarios || []).slice(0, 4),
+        },
+        episodios: [],
+      });
+    } catch (e) {
+      setError("No se pudo analizar el libro (" + e.message + "). Probá de nuevo; el PDF puede tener hasta 100 páginas.");
+    }
+    setBusy(null);
+  }
+
+  /* paso 2: temporada */
+  async function armarTemporada() {
+    setError(null);
+    setBusy("Armando la temporada…");
+    try {
+      const p = projectRef.current;
+      const prompt = `Obra: "${p.titulo}". Logline: ${p.analisis.logline}. Tono: ${p.analisis.tono}.
+Dividí la historia del libro en ${cfg.episodios} episodios, cada uno con arco propio y un gancho final (salvo el último).
+${reglas}
+Devolvé este JSON: {"episodios":[{"titulo":"...","resumen":"..."}]}
+Exactamente ${cfg.episodios} episodios. Resumen: máximo 28 palabras. En español.`;
+      const r = await askJSON({ pdf: file?.b64, prompt });
+      const eps = (r.episodios || []).slice(0, cfg.episodios).map((e, i) => ({
+        n: i + 1,
+        titulo: e.titulo,
+        resumen: e.resumen,
+        seg: perEp,
+        escenas: null,
+      }));
+      if (!eps.length) throw new Error("sin episodios");
+      setProject((q) => ({ ...q, episodios: eps }));
+    } catch (e) {
+      setError("No se pudo armar la temporada (" + e.message + "). Probá de nuevo.");
+    }
+    setBusy(null);
+  }
+
+  /* paso 3: escenas y planos */
+  async function generarEscena(i, j, scOverride, totalEsc) {
+    const p = projectRef.current;
+    const ep = p.episodios[i];
+    const sc = scOverride || ep.escenas[j];
+    const nEsc = totalEsc || ep.escenas?.length || 1;
+    updateScene(i, j, (s) => ({ ...s, error: null, cargando: true }));
+    try {
+      const lower = (x) => String(x || "").toLowerCase();
+      let chars = (p.bible.personajes || []).filter((c) =>
+        (sc.personajes || []).some((n) => lower(c.nombre).includes(lower(n)) || lower(n).includes(lower(c.nombre)))
+      );
+      if (!chars.length) chars = (p.bible.personajes || []).slice(0, 1);
+      const place = (p.bible.escenarios || []).find(
+        (x) => lower(x.nombre).includes(lower(sc.escenario)) || lower(sc.escenario).includes(lower(x.nombre))
+      );
+      const refs = [
+        ...chars.map((c) => `- ${c.nombre}: ${c.visual}`),
+        place ? `- Escenario ${place.nombre}: ${place.visual}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+      const nPl = Math.max(1, Math.round(sc.seg / 7));
+      const prompt = `Serie "${p.titulo}". Tono: ${p.analisis.tono}.
+Episodio ${ep.n}: ${ep.titulo} — ${ep.resumen}
+Escena ${j + 1} de ${nEsc}: "${sc.titulo}" — ${sc.resumen} (${sc.seg} s).
+Descripciones visuales fijas (copialas tal cual en cada prompt para mantener consistencia):
+${refs}
+${reglas}
+Escribí ${nPl} planos de 4 a 8 segundos cuya suma sea aproximadamente ${sc.seg} s.
+Devolvé este JSON: {"planos":[{"tipo":"plano general|plano medio|primer plano|detalle|cenital","seg":6,"prompt":"...","voz":"..."}]}
+"prompt": en inglés, máximo 40 palabras, para Google Flow: encuadre, sujeto con su descripción fija, acción, lugar, luz y movimiento de cámara. Sin diálogos ni texto en pantalla.
+"voz": locución en español, máximo 22 palabras; vacío si el plano va sin voz.`;
+      const r = await askJSON({ prompt });
+      const planos = (r.planos || [])
+        .filter((x) => x && typeof x.prompt === "string")
+        .map((x) => ({
+          tipo: x.tipo || "plano",
+          seg: Math.min(8, Math.max(3, Math.round(Number(x.seg) || 6))),
+          prompt: x.prompt,
+          voz: x.voz || "",
+        }));
+      if (!planos.length) throw new Error("sin planos");
+      updateScene(i, j, (s) => ({ ...s, planos, error: null, cargando: false }));
+    } catch (e) {
+      updateScene(i, j, (s) => ({ ...s, planos: null, cargando: false, error: "No se pudo generar esta escena." }));
+    }
+  }
+
+  async function generarEpisodio(i, keep) {
+    setError(null);
+    const p = projectRef.current;
+    const ep = p.episodios[i];
+    const k = Math.min(5, Math.max(2, Math.round(ep.seg / 40)));
+    setBusy("Episodio " + ep.n + ": armando escenas…");
+    try {
+      const arco = p.episodios.map((e) => `${e.n}. ${e.titulo}: ${e.resumen}`).join("\n");
+      const nombresP = (p.bible.personajes || []).map((c) => c.nombre).join(", ");
+      const nombresE = (p.bible.escenarios || []).map((c) => c.nombre).join(", ");
+      const prompt = `Obra: "${p.titulo}". Arco de la temporada:
+${arco}
+Desglosá el episodio ${ep.n} ("${ep.titulo}") en ${k} escenas, fieles al libro adjunto, que sumen ${ep.seg} segundos.
+${reglas}
+Personajes disponibles: ${nombresP}. Escenarios disponibles: ${nombresE}.
+Devolvé este JSON: {"escenas":[{"titulo":"...","resumen":"...","seg":40,"personajes":["..."],"escenario":"..."}]}
+Resumen: máximo 20 palabras. Usá solo los nombres disponibles. En español.`;
+      const r = await askJSON({ pdf: file?.b64, prompt });
+      let escenas = (r.escenas || []).slice(0, k).map((s) => ({
+        titulo: s.titulo,
+        resumen: s.resumen,
+        seg: Math.max(8, Math.round(Number(s.seg) || ep.seg / k)),
+        personajes: s.personajes || [],
+        escenario: s.escenario || "",
+        planos: null,
+      }));
+      if (!escenas.length) throw new Error("sin escenas");
+      const sum = escenas.reduce((a, s) => a + s.seg, 0) || 1;
+      escenas = escenas.map((s) => ({ ...s, seg: Math.max(8, Math.round((s.seg * ep.seg) / sum)) }));
+      updateEp(i, (e) => ({ ...e, escenas }));
+      setOpen((o) => ({ ...o, [i]: true }));
+      setBusy("Episodio " + ep.n + ": escribiendo los planos de " + escenas.length + " escenas…");
+      await Promise.all(escenas.map((s, j) => generarEscena(i, j, s, escenas.length)));
+    } catch (e) {
+      setError("No se pudo generar el episodio " + ep.n + " (" + e.message + "). Probá de nuevo.");
+    }
+    if (!keep) setBusy(null);
+  }
+
+  async function completarEpisodio(i) {
+    setBusy("Completando planos…");
+    const ep = projectRef.current.episodios[i];
+    await Promise.all(
+      ep.escenas.map((s, j) => (s.planos ? null : generarEscena(i, j, s, ep.escenas.length)))
+    );
+    setBusy(null);
+  }
+
+  async function generarTodo() {
+    const eps = projectRef.current.episodios;
+    for (let i = 0; i < eps.length; i++) {
+      const e = projectRef.current.episodios[i];
+      if (!e.escenas) await generarEpisodio(i, true);
+      else if (e.escenas.some((s) => !s.planos)) await completarEpisodio(i);
+    }
+    setBusy(null);
+  }
+
+  const copy = async (text, label) => {
+    const ok = await copyText(text);
+    say(ok ? label + " copiado" : "No se pudo copiar. Usá Descargar guion.");
+  };
+
+  /* derivados */
+  const eps = project?.episodios || [];
+  const shots = eps.flatMap((e) => (e.escenas || []).flatMap((s) => s.planos || []));
+  const clips = shots.length;
+  const secs = shots.reduce((a, s) => a + (s.seg || 0), 0);
+  const gens = Math.ceil(clips * (cfg.fr || 1));
+  const planosListos = eps.length > 0 && eps.every((e) => e.escenas && e.escenas.every((s) => s.planos));
+  const etapas = [
+    { t: "Libro", ok: !!file || !!project },
+    { t: "Análisis", ok: !!project },
+    { t: "Temporada", ok: eps.length > 0 },
+    { t: "Planos", ok: planosListos },
+  ];
+  const puedeAnalizar = !!file && autor.trim() && auth && !busy && !!getKey();
+  const sem = project ? SEMAFORO[project.analisis.semaforo] || SEMAFORO.amarillo : null;
+
+  return (
+    <div className="ls-root">
+      <style>{CSS}</style>
+      <div className="ls-wrap">
+        <header>
+          <h1 className="ls-title ls-serif">Del libro a la serie</h1>
+          <p className="ls-lead ls-serif">
+            Cargá el PDF de una obra y obtené la serie planificada plano por plano, con prompts para Google Flow y voz en
+            off para ElevenLabs.
+          </p>
+          <ol className="ls-steps" aria-label="Avance">
+            {etapas.map((e, i) => (
+              <li key={e.t} className={e.ok ? "done" : ""}>
+                <span className="ls-dot" aria-hidden="true">{e.ok ? "✓" : i + 1}</span>
+                {e.t}
+              </li>
+            ))}
+          </ol>
+        </header>
+
+        {error && (
+          <div className="ls-error" role="alert">
+            <span>{error}</span>
+            <button className="ls-link" onClick={() => setError(null)}>Cerrar</button>
+          </div>
+        )}
+
+        {/* CONEXIÓN */}
+        <section className="ls-card">
+          <div className="ls-between">
+            <h2 className="ls-h2 ls-serif">Conexión con Claude</h2>
+            <button className="ls-link" onClick={() => setShowCfg(!showCfg)}>
+              {showCfg ? "Ocultar" : apiKey ? "Cambiar" : "Configurar"}
+            </button>
+          </div>
+          {showCfg ? (
+            <>
+              <div className="ls-grid">
+                <label className="ls-field">
+                  <span>Clave de API de Anthropic</span>
+                  <input type="password" autoComplete="off" placeholder="sk-ant-..." value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
+                </label>
+                <label className="ls-field">
+                  <span>Modelo</span>
+                  <input value={model} onChange={(e) => setModel(e.target.value)} />
+                </label>
+              </div>
+              <button className="ls-btn small" onClick={guardarAjustes}>Guardar ajustes</button>
+              <p className="ls-hint">La clave se guarda solo en este navegador y se envía únicamente a Anthropic. Cada persona que use la web carga la suya.</p>
+            </>
+          ) : (
+            <p className="ls-hint">Clave guardada en este navegador.</p>
+          )}
+        </section>
+
+        {/* OBRA */}
+        <section className="ls-card">
+          <h2 className="ls-h2 ls-serif">La obra</h2>
+          {!locked && (
+            <label className="ls-drop">
+              <input type="file" accept="application/pdf,.pdf" onChange={onFile} />
+              <span className="ls-drop-main">{file ? file.name : "Elegir el PDF del libro"}</span>
+              <span className="ls-hint">
+                {file ? (file.size / 1024 / 1024).toFixed(1) + " MB" : "Hasta 100 páginas y 20 MB"}
+              </span>
+            </label>
+          )}
+          <div className="ls-grid">
+            <label className="ls-field">
+              <span>Título de la obra</span>
+              <input value={titulo} onChange={(e) => setTitulo(e.target.value)} disabled={locked} />
+            </label>
+            <label className="ls-field">
+              <span>Autor o autora</span>
+              <input value={autor} onChange={(e) => setAutor(e.target.value)} disabled={locked} />
+            </label>
+            <label className="ls-field">
+              <span>Episodios</span>
+              <select value={cfg.episodios} disabled={locked} onChange={(e) => setCfg({ ...cfg, episodios: +e.target.value })}>
+                {[2, 3, 4, 5, 6, 7, 8].map((n) => (
+                  <option key={n} value={n}>{n}</option>
+                ))}
+              </select>
+            </label>
+            <label className="ls-field">
+              <span>Duración total (minutos)</span>
+              <input
+                type="number"
+                min="2"
+                max="60"
+                value={cfg.minutos}
+                disabled={locked}
+                onChange={(e) => setCfg({ ...cfg, minutos: Math.min(60, Math.max(2, +e.target.value || 2)) })}
+              />
+            </label>
+            <label className="ls-field">
+              <span>Factor de regeneración</span>
+              <input
+                type="number"
+                min="1"
+                max="5"
+                step="0.1"
+                value={cfg.fr}
+                onChange={(e) => setCfg({ ...cfg, fr: Math.max(1, +e.target.value || 1) })}
+              />
+            </label>
+          </div>
+          <label className="ls-check">
+            <input type="checkbox" checked={cfg.sinMenores} disabled={locked} onChange={(e) => setCfg({ ...cfg, sinMenores: e.target.checked })} />
+            <span>Sin menores en pantalla (evita rechazos de Google Flow)</span>
+          </label>
+          <label className="ls-check">
+            <input type="checkbox" checked={auth} disabled={locked} onChange={(e) => setAuth(e.target.checked)} />
+            <span>Tengo autorización escrita del autor para adaptar esta obra</span>
+          </label>
+          <div className="ls-row">
+            {!locked ? (
+              <button className="ls-btn" disabled={!puedeAnalizar} onClick={analizar}>
+                Analizar el libro
+              </button>
+            ) : (
+              <button className="ls-btn ghost" onClick={nuevo}>Empezar otra obra</button>
+            )}
+          </div>
+          {!locked && !puedeAnalizar && (
+            <p className="ls-hint">Falta: {[!file && "el PDF", !autor.trim() && "el autor", !auth && "la autorización", !getKey() && "la clave de API"].filter(Boolean).join(", ")}.</p>
+          )}
+        </section>
+
+        {/* ANÁLISIS */}
+        {project && (
+          <section className="ls-card">
+            <h2 className="ls-h2 ls-serif">Análisis de adaptabilidad</h2>
+            <p className={"ls-sem " + sem.cls}>
+              <span className="ls-sem-dot" aria-hidden="true" />
+              <strong>{sem.txt}</strong>
+            </p>
+            <p>{project.analisis.motivo}</p>
+            <p className="ls-serif ls-logline">{project.analisis.logline}</p>
+            <p className="ls-hint">
+              {project.analisis.genero} · {project.analisis.tono}
+            </p>
+            <h3 className="ls-h3">Personajes</h3>
+            <ul className="ls-bible">
+              {project.bible.personajes.map((c) => (
+                <li key={c.nombre}>
+                  <strong>{c.nombre}</strong>
+                  <span>{c.visual}</span>
+                </li>
+              ))}
+            </ul>
+            <h3 className="ls-h3">Escenarios</h3>
+            <ul className="ls-bible">
+              {project.bible.escenarios.map((c) => (
+                <li key={c.nombre}>
+                  <strong>{c.nombre}</strong>
+                  <span>{c.visual}</span>
+                </li>
+              ))}
+            </ul>
+            {eps.length === 0 && (
+              <div className="ls-row">
+                <button className="ls-btn" disabled={!!busy} onClick={armarTemporada}>
+                  Armar la temporada
+                </button>
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* TEMPORADA */}
+        {eps.length > 0 && (
+          <section className="ls-card">
+            <div className="ls-between">
+              <h2 className="ls-h2 ls-serif">Temporada</h2>
+              {!planosListos && (
+                <button className="ls-btn small" disabled={!!busy} onClick={generarTodo}>
+                  Generar toda la temporada
+                </button>
+              )}
+            </div>
+            <p className="ls-totals">
+              <strong>{clips}</strong> planos · <strong>{fmt(secs)}</strong> de video · cerca de <strong>{gens}</strong> generaciones
+              en Flow (factor {cfg.fr})
+            </p>
+
+            {eps.map((ep, i) => {
+              const hecho = ep.escenas && ep.escenas.every((s) => s.planos);
+              const faltan = ep.escenas && ep.escenas.some((s) => !s.planos);
+              return (
+                <article key={ep.n} className="ls-ep">
+                  <button
+                    className="ls-ep-head"
+                    onClick={() => setOpen((o) => ({ ...o, [i]: !o[i] }))}
+                    aria-expanded={!!open[i]}
+                  >
+                    <span className="ls-ep-n">{ep.n}</span>
+                    <span className="ls-ep-t">
+                      <strong className="ls-serif">{ep.titulo}</strong>
+                      <span>{ep.resumen}</span>
+                    </span>
+                    <span className="ls-ep-s">{fmt(ep.seg)}</span>
+                  </button>
+                  {open[i] && (
+                    <div className="ls-ep-body">
+                      <div className="ls-row wrap">
+                        {!ep.escenas && (
+                          <button className="ls-btn small" disabled={!!busy} onClick={() => generarEpisodio(i)}>
+                            Generar escenas y planos
+                          </button>
+                        )}
+                        {faltan && (
+                          <button className="ls-btn small" disabled={!!busy} onClick={() => completarEpisodio(i)}>
+                            Completar planos
+                          </button>
+                        )}
+                        {hecho && (
+                          <>
+                            <button className="ls-btn small ghost" onClick={() => copy(epPrompts(ep), "Prompts")}>
+                              Copiar prompts
+                            </button>
+                            <button className="ls-btn small ghost" onClick={() => copy(epVoz(ep), "Voz en off")}>
+                              Copiar voz en off
+                            </button>
+                            <button className="ls-btn small ghost" disabled={!!busy} onClick={() => generarEpisodio(i)}>
+                              Regenerar episodio
+                            </button>
+                          </>
+                        )}
+                      </div>
+                      {(ep.escenas || []).map((s, j) => (
+                        <div key={j} className="ls-scene">
+                          <h4 className="ls-serif">
+                            Escena {j + 1}: {s.titulo} <span className="ls-hint">({s.seg} s)</span>
+                          </h4>
+                          <p className="ls-hint">{s.resumen}</p>
+                          {s.cargando && <p className="ls-hint">Escribiendo planos…</p>}
+                          {s.error && (
+                            <p className="ls-inline-err">
+                              {s.error}{" "}
+                              <button className="ls-link" disabled={!!busy} onClick={() => generarEscena(i, j)}>
+                                Reintentar
+                              </button>
+                            </p>
+                          )}
+                          {(s.planos || []).map((pl, k) => (
+                            <div key={k} className="ls-shot">
+                              <div className="ls-frame" aria-hidden="true">
+                                <span className="ls-fr-n">{k + 1}</span>
+                                <span className="ls-fr-t">{pl.seg} s</span>
+                              </div>
+                              <div className="ls-shot-body">
+                                <div className="ls-tipo">{pl.tipo}</div>
+                                <p className="ls-prompt">{pl.prompt}</p>
+                                {pl.voz && <p className="ls-voz ls-serif">{pl.voz}</p>}
+                                <button className="ls-link" onClick={() => copy(pl.prompt, "Prompt")}>
+                                  Copiar prompt
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </article>
+              );
+            })}
+
+            <div className="ls-row wrap ls-export">
+              <button
+                className="ls-btn small ghost"
+                onClick={() => download((project.titulo || "serie").replace(/\s+/g, "-") + ".json", JSON.stringify(project, null, 2), "application/json")}
+              >
+                Descargar proyecto (.json)
+              </button>
+              <button
+                className="ls-btn small ghost"
+                disabled={!clips}
+                onClick={() => download((project.titulo || "serie").replace(/\s+/g, "-") + "-guion.txt", guionTexto(project), "text/plain")}
+              >
+                Descargar guion (.txt)
+              </button>
+            </div>
+          </section>
+        )}
+
+        {/* GUARDADOS */}
+        <section className="ls-card">
+          <h2 className="ls-h2 ls-serif">Proyectos guardados</h2>
+          {saved.length === 0 && <p className="ls-hint">Los proyectos se guardan solos mientras trabajás. Todavía no hay ninguno.</p>}
+          <ul className="ls-saved">
+            {saved.map((s) => (
+              <li key={s.key}>
+                <span>
+                  <strong>{s.titulo}</strong>
+                  <span className="ls-hint"> {s.autor}</span>
+                </span>
+                <span>
+                  <button className="ls-link" onClick={() => openSaved(s.key)}>Abrir</button>
+                  <button className="ls-link danger" onClick={() => deleteSaved(s.key)}>Borrar</button>
+                </span>
+              </li>
+            ))}
+          </ul>
+          <label className="ls-link ls-import">
+            Importar proyecto (.json)
+            <input type="file" accept="application/json,.json" onChange={importJSON} />
+          </label>
+          <p className="ls-hint">Para generar episodios de un proyecto importado o reabierto, volvé a cargar el PDF solo si querés máxima fidelidad al libro.</p>
+        </section>
+      </div>
+
+      {busy && (
+        <div className="ls-busy" role="status">
+          <span className="ls-spin" aria-hidden="true" />
+          {busy}
+        </div>
+      )}
+      {toast && <div className="ls-toast" role="status">{toast}</div>}
+    </div>
+  );
+}
+
+/* ---------- estilos ---------- */
+
+const CSS = `
+.ls-root{--paper:#EDF0F4;--ink:#12182B;--panel:#fff;--line:#C8CFDA;--muted:#566075;--accent:#2442E8;--ok:#1B8A5C;--mid:#9A6B00;--bad:#C93B3B;
+background:var(--paper);color:var(--ink);min-height:100vh;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:15px;line-height:1.5;padding:20px 14px 110px;box-sizing:border-box}
+.ls-root *{box-sizing:border-box}
+.ls-wrap{max-width:760px;margin:0 auto}
+.ls-serif{font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif}
+.ls-title{font-size:36px;line-height:1.08;margin:6px 0 10px;font-weight:600;letter-spacing:-.01em}
+.ls-lead{font-size:18px;line-height:1.5;color:var(--muted);margin:0 0 18px;max-width:34em}
+.ls-steps{list-style:none;display:flex;gap:6px;padding:0;margin:0 0 18px;flex-wrap:wrap}
+.ls-steps li{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);padding:4px 10px 4px 4px;border:1px solid var(--line);border-radius:999px;background:var(--panel)}
+.ls-steps li.done{color:var(--ink);border-color:var(--ink)}
+.ls-dot{width:20px;height:20px;border-radius:50%;background:var(--line);color:var(--ink);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:600}
+.ls-steps li.done .ls-dot{background:var(--ink);color:#fff}
+.ls-card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 16px;margin-bottom:16px}
+.ls-h2{font-size:22px;margin:0 0 12px;font-weight:600}
+.ls-h3{font-size:14px;margin:16px 0 6px;font-weight:600;color:var(--muted)}
+.ls-hint{color:var(--muted);font-size:13px;margin:4px 0}
+.ls-drop{display:flex;flex-direction:column;gap:2px;border:2px dashed var(--ink);border-radius:8px;padding:22px 14px;text-align:center;cursor:pointer;margin-bottom:14px;background:var(--paper)}
+.ls-drop input{position:absolute;opacity:0;width:1px;height:1px}
+.ls-drop:focus-within{outline:3px solid var(--accent);outline-offset:2px}
+.ls-drop-main{font-weight:600;font-size:16px;word-break:break-word}
+.ls-grid{display:grid;grid-template-columns:1fr;gap:12px;margin-bottom:12px}
+@media(min-width:560px){.ls-grid{grid-template-columns:1fr 1fr}}
+.ls-field{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--muted)}
+.ls-field input,.ls-field select{font:inherit;font-size:16px;color:var(--ink);padding:9px 10px;border:1px solid var(--line);border-radius:6px;background:#fff;width:100%}
+.ls-field input:disabled,.ls-field select:disabled{background:var(--paper);color:var(--muted)}
+.ls-check{display:flex;gap:10px;align-items:flex-start;margin:10px 0;font-size:14px}
+.ls-check input{margin-top:4px;width:18px;height:18px;flex:none}
+.ls-row{display:flex;gap:8px;margin-top:14px}
+.ls-row.wrap{flex-wrap:wrap}
+.ls-between{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.ls-btn{font:inherit;font-weight:600;font-size:15px;background:var(--accent);color:#fff;border:1px solid var(--accent);border-radius:6px;padding:11px 18px;cursor:pointer}
+.ls-btn.small{font-size:13px;padding:8px 12px}
+.ls-btn.ghost{background:#fff;color:var(--ink);border-color:var(--ink)}
+.ls-btn:disabled{opacity:.45;cursor:not-allowed}
+.ls-btn:focus-visible,.ls-link:focus-visible,.ls-ep-head:focus-visible,.ls-field input:focus-visible,.ls-field select:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+.ls-link{font:inherit;font-size:13px;background:none;border:none;color:var(--accent);text-decoration:underline;cursor:pointer;padding:4px 6px}
+.ls-link.danger{color:var(--bad)}
+.ls-error{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;background:#FBEAEA;border:1px solid var(--bad);color:#7A1F1F;border-radius:8px;padding:10px 12px;margin-bottom:14px;font-size:14px}
+.ls-sem{display:flex;align-items:center;gap:8px;margin:0 0 6px;font-size:16px}
+.ls-sem-dot{width:12px;height:12px;border-radius:50%;background:currentColor}
+.ls-sem.ok{color:var(--ok)}.ls-sem.mid{color:var(--mid)}.ls-sem.bad{color:var(--bad)}
+.ls-logline{font-size:19px;line-height:1.45;margin:12px 0 4px;border-left:3px solid var(--ink);padding-left:12px}
+.ls-bible{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.ls-bible li{display:flex;flex-direction:column;border-bottom:1px solid var(--line);padding-bottom:8px}
+.ls-bible li span{font-size:13px;color:var(--muted)}
+.ls-totals{background:var(--paper);border-radius:6px;padding:10px 12px;font-size:14px;margin:6px 0 14px}
+.ls-ep{border:1px solid var(--line);border-radius:8px;margin-bottom:10px;overflow:hidden}
+.ls-ep-head{display:flex;gap:12px;align-items:flex-start;width:100%;text-align:left;background:#fff;border:none;padding:12px;cursor:pointer;font:inherit;color:inherit}
+.ls-ep-n{flex:none;width:32px;height:32px;border-radius:50%;background:var(--ink);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:600}
+.ls-ep-t{display:flex;flex-direction:column;flex:1;min-width:0}
+.ls-ep-t strong{font-size:17px}
+.ls-ep-t span{font-size:13px;color:var(--muted)}
+.ls-ep-s{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted)}
+.ls-ep-body{padding:4px 12px 14px;border-top:1px solid var(--line);background:#FAFBFC}
+.ls-scene{margin-top:18px}
+.ls-scene h4{font-size:17px;margin:0;font-weight:600}
+.ls-shot{display:flex;gap:12px;margin:12px 0;align-items:flex-start}
+.ls-frame{flex:none;width:104px;aspect-ratio:16/9;background:var(--ink);border-radius:3px;position:relative;
+background-image:linear-gradient(rgba(255,255,255,.22),rgba(255,255,255,.22)),linear-gradient(90deg,rgba(255,255,255,.22),rgba(255,255,255,.22));
+background-size:100% 1px,1px 100%;background-position:center,center;background-repeat:no-repeat;box-shadow:inset 0 0 0 3px var(--ink),inset 0 0 0 4px rgba(255,255,255,.35)}
+.ls-fr-n{position:absolute;left:8px;top:6px;color:#fff;font-weight:600;font-size:13px}
+.ls-fr-t{position:absolute;right:8px;bottom:6px;color:#fff;font-size:12px;font-variant-numeric:tabular-nums}
+.ls-shot-body{flex:1;min-width:0}
+.ls-tipo{font-size:13px;font-weight:600;color:var(--accent)}
+.ls-prompt{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;line-height:1.5;margin:3px 0;word-break:break-word}
+.ls-voz{font-style:italic;font-size:15px;margin:4px 0;color:#2D3550;border-left:2px solid var(--line);padding-left:8px}
+.ls-inline-err{color:var(--bad);font-size:13px}
+.ls-export{border-top:1px solid var(--line);padding-top:14px;margin-top:16px}
+.ls-saved{list-style:none;padding:0;margin:0 0 8px}
+.ls-saved li{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.ls-import{position:relative;display:inline-block;cursor:pointer}
+.ls-import input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%}
+.ls-busy{position:fixed;left:12px;right:12px;bottom:14px;max-width:560px;margin:0 auto;background:var(--ink);color:#fff;border-radius:10px;padding:12px 14px;display:flex;gap:10px;align-items:center;font-size:14px;box-shadow:0 6px 24px rgba(18,24,43,.35)}
+.ls-spin{width:16px;height:16px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:ls-r .8s linear infinite;flex:none}
+@keyframes ls-r{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.ls-spin{animation:none}}
+.ls-toast{position:fixed;left:50%;top:14px;transform:translateX(-50%);background:var(--ok);color:#fff;border-radius:999px;padding:8px 16px;font-size:14px;z-index:5}
+`;
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<MotorDeSeries />);
+</script>
+</body>
+</html>
